@@ -84,6 +84,7 @@ function createHTTPClient(callbacks: TranscriptCallback) {
       binary += String.fromCharCode(...slice);
     }
     const audio = btoa(binary);
+    console.log(`[ASR] Sending ${merged.length} bytes, base64: ${audio.length} chars`);
 
     try {
       const res = await fetch("/api/asr", {
@@ -93,12 +94,9 @@ function createHTTPClient(callbacks: TranscriptCallback) {
       });
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        callbacks.onError(
-          new Error(
-            (err as { error?: string }).error ?? `ASR failed: ${res.status}`,
-          ),
-        );
+        const errText = await res.text().catch(() => "");
+        console.error(`[ASR] HTTP ${res.status}: ${errText}`);
+        callbacks.onError(new Error(errText || `ASR failed: ${res.status}`));
         return;
       }
 
@@ -127,6 +125,7 @@ function createHTTPClient(callbacks: TranscriptCallback) {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "ASR request failed";
+      console.error(`[ASR] Fetch error: ${msg}`, err);
       callbacks.onError(new Error(msg));
     } finally {
       flushing = false;
