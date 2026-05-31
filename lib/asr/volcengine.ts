@@ -295,7 +295,11 @@ export function createVolcengineASR(callbacks: ASRCallback): {
   });
 
   function sendChunk(chunk: ArrayBuffer) {
-    if (closed || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (closed || !ws || ws.readyState !== WebSocket.OPEN) {
+      console.log(`[ASR WS] sendChunk skipped: closed=${closed}, ws=${!!ws}, state=${ws?.readyState}`);
+      return;
+    }
+    console.log(`[ASR WS] sendChunk: ${chunk.byteLength} bytes`);
     const payload = Buffer.from(chunk);
     ws.send(
       buildClientMessage(
@@ -310,9 +314,12 @@ export function createVolcengineASR(callbacks: ASRCallback): {
   function close() {
     if (closed) return;
     closed = true;
+    console.log(`[ASR WS] close called, ws state: ${ws?.readyState}`);
     if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log(`[ASR WS] Sending end-of-audio signal`);
       ws.send(buildEmptyLastAudioMessage());
       setTimeout(() => {
+        console.log(`[ASR WS] Closing WebSocket`);
         ws?.close();
         ws = null;
       }, 1000);
