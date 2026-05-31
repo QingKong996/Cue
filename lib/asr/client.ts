@@ -74,6 +74,8 @@ function createHTTPClient(callbacks: TranscriptCallback) {
     }
     pendingChunks = [];
 
+    console.log(`[ASR] Sending ${merged.length} bytes of audio`);
+
     // base64
     let binary = "";
     const step = 8192;
@@ -142,6 +144,7 @@ function createHTTPClient(callbacks: TranscriptCallback) {
   function sendChunk(chunk: ArrayBuffer) {
     if (state !== "connected") return;
     pendingChunks.push(chunk);
+    console.log(`[ASR] Chunk received: ${chunk.byteLength} bytes, pending: ${pendingChunks.length}`);
   }
 
   function disconnect() {

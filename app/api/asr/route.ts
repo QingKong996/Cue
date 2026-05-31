@@ -18,10 +18,13 @@ async function handleHTTP(audio: string) {
     );
     const bytes = Buffer.from(audio, "base64");
     const ab = new Uint8Array(bytes).buffer;
+    console.log(`[ASR HTTP] Received ${bytes.length} bytes`);
     const result = await recognizeAudio(ab);
+    console.log(`[ASR HTTP] Result: "${result.text}"`);
     return NextResponse.json(result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "ASR failed";
+    console.error(`[ASR HTTP] Error: ${msg}`);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
