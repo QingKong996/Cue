@@ -208,6 +208,8 @@ export function createVolcengineASR(callbacks: ASRCallback): {
           SERIALIZATION_JSON,
         ),
       );
+      // Ready after config is sent — connection is open and configured
+      resolve();
     });
 
     ws.on("message", (data: Buffer | ArrayBuffer) => {
@@ -290,10 +292,6 @@ export function createVolcengineASR(callbacks: ASRCallback): {
     ws.on("close", () => {
       ws = null;
     });
-
-    // Resolve ready after a short delay for config ack
-    // In practice, we resolve immediately and handle errors in the message handler
-    setTimeout(resolve, 500);
   });
 
   function sendChunk(chunk: ArrayBuffer) {
