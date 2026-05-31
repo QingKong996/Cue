@@ -1,8 +1,10 @@
 /**
- * Volcengine non-streaming ASR — HTTP API.
- * Sends complete audio buffer, returns recognized text.
- * Compatible with Vercel serverless functions.
+ * Volcengine non-streaming ASR — one-shot recognition via WebSocket.
+ * Opens a WebSocket, sends all audio at once, collects result, closes.
+ * Compatible with Vercel serverless (within timeout limits).
  */
+
+import { createVolcengineASR } from "./volcengine";
 
 export type ASRResult = {
   text: string;
@@ -10,91 +12,59 @@ export type ASRResult = {
 };
 
 /**
- * Recognize a complete audio buffer using Volcengine's HTTP ASR API.
+ * Recognize a complete audio buffer using Volcengine's WebSocket ASR.
  * Audio should be 16kHz mono 16-bit PCM.
  */
 export async function recognizeAudio(
   audioBuffer: ArrayBuffer,
 ): Promise<ASRResult> {
-  const appId = process.env.VOLCENGINE_APP_KEY;
-  const accessToken = process.env.VOLCENGINE_ACCESS_KEY_ID;
+  return new Promise<ASRResult>((resolve, reject) => {
+    const parts: string[] = [];
+    let settled = false;
 
-  if (!appId || !accessToken) {
-    throw new Error("Missing VOLCENGINE credentials");
-  }
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        asr.close();
+        resolve({ text: parts.join("") });
+      }
+    }, 14_000);
 
-  // Convert to base64
-  const bytes = Buffer.from(audioBuffer);
-  const audioBase64 = bytes.toString("base64");
+    function settle() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({ text: parts.join("") });
+    }
 
-  const payload = {
-    app: {
-      appid: appId,
-      token: "access_token",
-      cluster: "volcengine_input_common",
-    },
-    user: {
-      uid: "cue-user",
-    },
-    audio: {
-      format: "pcm",
-      codec: "raw",
-      rate: 16000,
-      bits: 16,
-      channel: 1,
-    },
-    request: {
-      reqid: crypto.randomUUID(),
-      sequence: -1,
-      nbest: 1,
-      text: "",
-      show_utterances: true,
-    },
-    additions: {
-      with_speaker_info: "False",
-    },
-  };
-
-  const response = await fetch(
-    "https://openspeech.bytedance.com/api/v1/auc",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer;${appId};${accessToken}`,
+    const asr = createVolcengineASR({
+      onPartial() {},
+      onFinal(text) {
+        if (text.trim()) parts.push(text.trim());
       },
-      body: JSON.stringify({
-        ...payload,
-        audio: {
-          ...payload.audio,
-          data: audioBase64,
-        },
-      }),
-    },
-  );
+      onError(error) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(error);
+        }
+      },
+    });
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Volcengine HTTP ASR failed: ${response.status} ${text}`);
-  }
-
-  const data = await response.json();
-
-  // Parse response
-  const result: ASRResult = { text: "" };
-
-  if (data.result && typeof data.result.text === "string") {
-    result.text = data.result.text;
-  }
-
-  if (Array.isArray(data.result?.utterances)) {
-    result.utterances = data.result.utterances.map(
-      (u: { text: string; definite?: boolean }) => ({
-        text: u.text,
-        definite: !!u.definite,
-      }),
-    );
-  }
-
-  return result;
+    asr.ready
+      .then(() => {
+        asr.sendChunk(audioBuffer);
+        asr.close();
+        // Close sends end-of-audio signal then closes WS after 1s
+        // Give extra time for server to return final result
+        setTimeout(settle, 3000);
+      })
+      .catch((err) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(err);
+        }
+      });
+  });
 }

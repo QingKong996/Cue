@@ -12,13 +12,13 @@ import { NextResponse } from "next/server";
 // ── Non-streaming mode (default) ──
 
 async function handleHTTP(audio: string) {
-  const audioBuffer = Buffer.from(audio, "base64");
-
   try {
     const { recognizeAudio } = await import(
       "../../../lib/asr/volcengine-http"
     );
-    const result = await recognizeAudio(audioBuffer.buffer);
+    const bytes = Buffer.from(audio, "base64");
+    const ab = new Uint8Array(bytes).buffer;
+    const result = await recognizeAudio(ab);
     return NextResponse.json(result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "ASR failed";
