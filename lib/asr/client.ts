@@ -49,6 +49,7 @@ function createHTTPClient(callbacks: TranscriptCallback) {
   let turnId = 0;
   let batchTimer: ReturnType<typeof setInterval> | null = null;
   let pendingChunks: ArrayBuffer[] = [];
+  let flushing = false;
 
   function setState(next: ConnectionState) {
     state = next;
@@ -60,7 +61,8 @@ function createHTTPClient(callbacks: TranscriptCallback) {
   }
 
   async function flushChunks() {
-    if (pendingChunks.length === 0) return;
+    if (flushing || pendingChunks.length === 0) return;
+    flushing = true;
 
     // Merge chunks
     const totalLength = pendingChunks.reduce((s, c) => s + c.byteLength, 0);
@@ -124,6 +126,8 @@ function createHTTPClient(callbacks: TranscriptCallback) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "ASR request failed";
       callbacks.onError(new Error(msg));
+    } finally {
+      flushing = false;
     }
   }
 
@@ -131,7 +135,7 @@ function createHTTPClient(callbacks: TranscriptCallback) {
     if (state === "connecting" || state === "connected") return;
     setState("connecting");
     // HTTP mode is always "connected" — no persistent connection needed
-    batchTimer = setInterval(flushChunks, 3000);
+    batchTimer = setInterval(flushChunks, 5000);
     setState("connected");
   }
 
