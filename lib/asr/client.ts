@@ -19,46 +19,51 @@ type ConnectionState =
   | "error";
 
 /**
- * Browser-side ASR client. Session-based:
- * 1. POST { action: "start" } → sessionId + SSE
- * 2. Batch audio chunks → POST { action: "chunk" }
- * 3. Read SSE for partial/final results
+ * Browser-side ASR client with two modes:
+ *
+ * - "http" (default): batches audio chunks, sends as single POST, gets text back.
+ *   Vercel-compatible, ~3s latency per chunk.
+ *
+ * - "stream": session-based WebSocket bridge, real-time partial+final results.
+ *   Requires long-running server.
  */
-export function createASRClient(callbacks: TranscriptCallback): {
+export function createASRClient(
+  callbacks: TranscriptCallback,
+  mode: "http" | "stream" = "http",
+): {
   connect: () => void;
   sendChunk: (chunk: ArrayBuffer) => void;
   disconnect: () => void;
   getState: () => string;
 } {
+  if (mode === "stream") {
+    return createStreamClient(callbacks);
+  }
+  return createHTTPClient(callbacks);
+}
+
+// ── HTTP mode (non-streaming, default) ──
+
+function createHTTPClient(callbacks: TranscriptCallback) {
   let state: ConnectionState = "idle";
   let turnId = 0;
-  let sessionId: string | null = null;
-  let eventSource: EventSource | null = null;
-  let abortController: AbortController | null = null;
   let batchTimer: ReturnType<typeof setInterval> | null = null;
   let pendingChunks: ArrayBuffer[] = [];
-  // Buffer chunks while connecting
-  let connectBuffer: ArrayBuffer[] = [];
 
   function setState(next: ConnectionState) {
     state = next;
-    if (next !== "idle") {
-      callbacks.onStateChange(next);
-    }
+    if (next !== "idle") callbacks.onStateChange(next);
   }
 
   function nextTurnId(): string {
-    turnId++;
-    return `turn-${turnId}`;
+    return `turn-${++turnId}`;
   }
 
   async function flushChunks() {
-    if (!sessionId || pendingChunks.length === 0) return;
+    if (pendingChunks.length === 0) return;
 
-    const totalLength = pendingChunks.reduce(
-      (sum, c) => sum + c.byteLength,
-      0,
-    );
+    // Merge chunks
+    const totalLength = pendingChunks.reduce((s, c) => s + c.byteLength, 0);
     const merged = new Uint8Array(totalLength);
     let offset = 0;
     for (const chunk of pendingChunks) {
@@ -67,7 +72,125 @@ export function createASRClient(callbacks: TranscriptCallback): {
     }
     pendingChunks = [];
 
-    // base64 encode
+    // base64
+    let binary = "";
+    const step = 8192;
+    for (let i = 0; i < merged.length; i += step) {
+      const slice = merged.subarray(i, Math.min(i + step, merged.length));
+      binary += String.fromCharCode(...slice);
+    }
+    const audio = btoa(binary);
+
+    try {
+      const res = await fetch("/api/asr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "http", audio }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        callbacks.onError(
+          new Error(
+            (err as { error?: string }).error ?? `ASR failed: ${res.status}`,
+          ),
+        );
+        return;
+      }
+
+      const data = (await res.json()) as {
+        text: string;
+        utterances?: Array<{ text: string; definite: boolean }>;
+      };
+
+      if (data.text) {
+        // Split by sentence-ending punctuation
+        const sentences = data.text.split(/(?<=[。！？.!?\n])/g).filter(Boolean);
+        for (const sentence of sentences) {
+          if (sentence.trim()) {
+            callbacks.onFinal({
+              id: nextTurnId(),
+              timestamp: Date.now(),
+              text: sentence.trim(),
+              isFinal: true,
+            });
+          }
+        }
+        if (sentences.length === 0 && data.text.trim()) {
+          // No sentence boundary — show as partial, will become final on next batch
+          callbacks.onPartial(data.text.trim());
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "ASR request failed";
+      callbacks.onError(new Error(msg));
+    }
+  }
+
+  function connect() {
+    if (state === "connecting" || state === "connected") return;
+    setState("connecting");
+    // HTTP mode is always "connected" — no persistent connection needed
+    batchTimer = setInterval(flushChunks, 3000);
+    setState("connected");
+  }
+
+  function sendChunk(chunk: ArrayBuffer) {
+    if (state !== "connected") return;
+    pendingChunks.push(chunk);
+  }
+
+  function disconnect() {
+    if (batchTimer) {
+      clearInterval(batchTimer);
+      batchTimer = null;
+    }
+    // Flush remaining
+    flushChunks();
+    pendingChunks = [];
+    setState("disconnected");
+  }
+
+  function getState() {
+    return state;
+  }
+
+  return { connect, sendChunk, disconnect, getState };
+}
+
+// ── Stream mode (WebSocket bridge) ──
+
+function createStreamClient(callbacks: TranscriptCallback) {
+  let state: ConnectionState = "idle";
+  let turnId = 0;
+  let sessionId: string | null = null;
+  let eventSource: EventSource | null = null;
+  let abortController: AbortController | null = null;
+  let batchTimer: ReturnType<typeof setInterval> | null = null;
+  let pendingChunks: ArrayBuffer[] = [];
+  let connectBuffer: ArrayBuffer[] = [];
+
+  function setState(next: ConnectionState) {
+    state = next;
+    if (next !== "idle") callbacks.onStateChange(next);
+  }
+
+  function nextTurnId() {
+    return `turn-${++turnId}`;
+  }
+
+  async function flushChunks() {
+    if (!sessionId || pendingChunks.length === 0) return;
+
+    const totalLength = pendingChunks.reduce((s, c) => s + c.byteLength, 0);
+    const merged = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of pendingChunks) {
+      merged.set(new Uint8Array(chunk), offset);
+      offset += chunk.byteLength;
+    }
+    pendingChunks = [];
+
     let binary = "";
     const step = 8192;
     for (let i = 0; i < merged.length; i += step) {
@@ -80,11 +203,7 @@ export function createASRClient(callbacks: TranscriptCallback): {
       await fetch("/api/asr", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "chunk",
-          sessionId,
-          audio: base64,
-        }),
+        body: JSON.stringify({ action: "chunk", sessionId, audio: base64 }),
       });
     } catch {
       // Non-fatal
@@ -93,7 +212,6 @@ export function createASRClient(callbacks: TranscriptCallback): {
 
   async function connect() {
     if (state === "connecting" || state === "connected") return;
-
     setState("connecting");
     abortController = new AbortController();
 
@@ -108,8 +226,7 @@ export function createASRClient(callbacks: TranscriptCallback): {
       if (!startRes.ok) {
         const err = await startRes.json().catch(() => ({}));
         throw new Error(
-          (err as { error?: string }).error ??
-            `ASR start failed: ${startRes.status}`,
+          (err as { error?: string }).error ?? `ASR start failed: ${startRes.status}`,
         );
       }
 
@@ -118,7 +235,6 @@ export function createASRClient(callbacks: TranscriptCallback): {
       };
       sessionId = sid;
 
-      // SSE for results
       eventSource = new EventSource(`/api/asr?sessionId=${sid}`);
 
       eventSource.onmessage = (event) => {
@@ -127,45 +243,33 @@ export function createASRClient(callbacks: TranscriptCallback): {
             type: "partial" | "final" | "error";
             text: string;
           };
-
-          if (msg.type === "partial") {
-            callbacks.onPartial(msg.text);
-          } else if (msg.type === "final") {
+          if (msg.type === "partial") callbacks.onPartial(msg.text);
+          else if (msg.type === "final")
             callbacks.onFinal({
               id: nextTurnId(),
               timestamp: Date.now(),
               text: msg.text,
               isFinal: true,
             });
-          } else if (msg.type === "error") {
-            callbacks.onError(new Error(msg.text));
-          }
+          else if (msg.type === "error") callbacks.onError(new Error(msg.text));
         } catch {
           // Skip malformed
         }
       };
 
-      eventSource.onerror = () => {
-        // EventSource auto-reconnects; don't immediately error
-      };
+      eventSource.onerror = () => {};
 
-      // Flush connect buffer + start batch timer
       pendingChunks = [...connectBuffer, ...pendingChunks];
       connectBuffer = [];
-
-      batchTimer = setInterval(() => {
-        flushChunks();
-      }, 400);
-
+      batchTimer = setInterval(flushChunks, 400);
       setState("connected");
-    } catch (err: unknown) {
+    } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
         setState("disconnected");
         return;
       }
-      const message =
-        err instanceof Error ? err.message : "ASR connection failed";
-      callbacks.onError(new Error(message));
+      const msg = err instanceof Error ? err.message : "ASR connection failed";
+      callbacks.onError(new Error(msg));
       setState("error");
     }
   }
@@ -184,16 +288,13 @@ export function createASRClient(callbacks: TranscriptCallback): {
       clearInterval(batchTimer);
       batchTimer = null;
     }
-
     await flushChunks();
-
     eventSource?.close();
     eventSource = null;
     abortController?.abort();
     abortController = null;
     pendingChunks = [];
     connectBuffer = [];
-
     if (sessionId) {
       try {
         await fetch("/api/asr", {
@@ -201,16 +302,13 @@ export function createASRClient(callbacks: TranscriptCallback): {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "stop", sessionId }),
         });
-      } catch {
-        // Best-effort
-      }
+      } catch {}
       sessionId = null;
     }
-
     setState("disconnected");
   }
 
-  function getState(): string {
+  function getState() {
     return state;
   }
 

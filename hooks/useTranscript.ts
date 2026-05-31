@@ -30,21 +30,24 @@ export function useTranscript(): UseTranscriptReturn {
   const startTranscription = useCallback(() => {
     if (clientRef.current) return;
 
-    const client = createASRClient({
-      onPartial(text) {
-        setPartialText(text);
+    const client = createASRClient(
+      {
+        onPartial(text) {
+          setPartialText(text);
+        },
+        onFinal(turn) {
+          setPartialText("");
+          setTurns((prev) => [...prev, turn]);
+        },
+        onError(error) {
+          console.error("[useTranscript] ASR error:", error.message);
+        },
+        onStateChange(state) {
+          setIsConnected(state === "connected");
+        },
       },
-      onFinal(turn) {
-        setPartialText("");
-        setTurns((prev) => [...prev, turn]);
-      },
-      onError(error) {
-        console.error("[useTranscript] ASR error:", error.message);
-      },
-      onStateChange(state) {
-        setIsConnected(state === "connected");
-      },
-    });
+      "http",
+    );
 
     clientRef.current = client;
     client.connect();

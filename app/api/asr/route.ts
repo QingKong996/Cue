@@ -1,15 +1,35 @@
 /**
- * ASR route handler — session-based approach.
+ * ASR route handler — supports both streaming and non-streaming modes.
  *
- * POST with { action: "start" } → creates Volcengine ASR session, returns sessionId
- * POST with { action: "chunk", sessionId, audio } → sends audio chunk
- * GET with ?sessionId=xxx → SSE stream of transcript results
+ * POST with { mode: "http", audio: base64 } → non-streaming (default, Vercel-compatible)
+ * POST with { action: "start" } → streaming session (requires long-running server)
+ * POST with { action: "chunk", sessionId, audio: base64 } → streaming chunk
+ * GET with ?sessionId=xxx → streaming SSE
  */
 
 import { NextResponse } from "next/server";
+
+// ── Non-streaming mode (default) ──
+
+async function handleHTTP(audio: string) {
+  const audioBuffer = Buffer.from(audio, "base64");
+
+  try {
+    const { recognizeAudio } = await import(
+      "../../../lib/asr/volcengine-http"
+    );
+    const result = await recognizeAudio(audioBuffer.buffer);
+    return NextResponse.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "ASR failed";
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
+}
+
+// ── Streaming mode (session-based) ──
+
 import { createVolcengineASR, type ASRCallback } from "@/lib/asr/volcengine";
 
-// In-memory session store
 const sessions = new Map<
   string,
   {
@@ -19,105 +39,75 @@ const sessions = new Map<
   }
 >();
 
-// ── POST: start session or send chunk ──
+async function handleStreamStart() {
+  const sessionId = `asr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-export async function POST(request: Request) {
+  const results: Array<{ type: string; text: string }> = [];
+  const listeners: Array<(data: { type: string; text: string }) => void> = [];
+
+  const callbacks: ASRCallback = {
+    onPartial(text) {
+      const msg = { type: "partial", text };
+      results.push(msg);
+      for (const fn of listeners) fn(msg);
+    },
+    onFinal(text) {
+      const msg = { type: "final", text };
+      results.push(msg);
+      for (const fn of listeners) fn(msg);
+    },
+    onError(error) {
+      const msg = { type: "error", text: error.message };
+      results.push(msg);
+      for (const fn of listeners) fn(msg);
+    },
+  };
+
   try {
-    const body = await request.json();
-
-    if (body.action === "start") {
-      const sessionId = `asr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-      const results: Array<{ type: string; text: string }> = [];
-      const listeners: Array<
-        (data: { type: string; text: string }) => void
-      > = [];
-
-      const callbacks: ASRCallback = {
-        onPartial(text) {
-          const msg = { type: "partial", text };
-          results.push(msg);
-          for (const fn of listeners) fn(msg);
-        },
-        onFinal(text) {
-          const msg = { type: "final", text };
-          results.push(msg);
-          for (const fn of listeners) fn(msg);
-        },
-        onError(error) {
-          const msg = { type: "error", text: error.message };
-          results.push(msg);
-          for (const fn of listeners) fn(msg);
-        },
-      };
-
-      try {
-        const asr = createVolcengineASR(callbacks);
-        await asr.ready;
-        sessions.set(sessionId, { asr, results, listeners });
-        return NextResponse.json({ sessionId });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "ASR init failed";
-        return NextResponse.json({ error: msg }, { status: 500 });
-      }
-    }
-
-    if (body.action === "chunk") {
-      const session = sessions.get(body.sessionId);
-      if (!session) {
-        return NextResponse.json(
-          { error: "Session not found" },
-          { status: 404 },
-        );
-      }
-      // audio is base64-encoded ArrayBuffer
-      const audioBuffer = Buffer.from(body.audio, "base64");
-      session.asr.sendChunk(audioBuffer.buffer);
-      return NextResponse.json({ ok: true });
-    }
-
-    if (body.action === "stop") {
-      const session = sessions.get(body.sessionId);
-      if (session) {
-        session.asr.close();
-        sessions.delete(body.sessionId);
-      }
-      return NextResponse.json({ ok: true });
-    }
-
-    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+    const asr = createVolcengineASR(callbacks);
+    await asr.ready;
+    sessions.set(sessionId, { asr, results, listeners });
+    return NextResponse.json({ sessionId });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "Internal error";
+    const msg = err instanceof Error ? err.message : "ASR init failed";
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
 
-// ── GET: SSE stream of results ──
+function handleStreamChunk(body: { sessionId: string; audio: string }) {
+  const session = sessions.get(body.sessionId);
+  if (!session) {
+    return NextResponse.json({ error: "Session not found" }, { status: 404 });
+  }
+  const audioBuffer = Buffer.from(body.audio, "base64");
+  session.asr.sendChunk(audioBuffer.buffer);
+  return NextResponse.json({ ok: true });
+}
 
-export async function GET(request: Request) {
-  const url = new URL(request.url);
-  const sessionId = url.searchParams.get("sessionId");
+function handleStreamStop(body: { sessionId: string }) {
+  const session = sessions.get(body.sessionId);
+  if (session) {
+    session.asr.close();
+    sessions.delete(body.sessionId);
+  }
+  return NextResponse.json({ ok: true });
+}
 
-  if (!sessionId || !sessions.has(sessionId)) {
-    return NextResponse.json(
-      { error: "Session not found" },
-      { status: 404 },
-    );
+function handleStreamSSE(sessionId: string, signal: AbortSignal) {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return NextResponse.json({ error: "Session not found" }, { status: 404 });
   }
 
-  const session = sessions.get(sessionId)!;
   const encoder = new TextEncoder();
-
   const stream = new ReadableStream({
     start(controller) {
-      // Send existing results
       for (const result of session.results) {
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify(result)}\n\n`),
         );
       }
 
-      // Listen for new results
       const listener = (data: { type: string; text: string }) => {
         try {
           controller.enqueue(
@@ -129,7 +119,6 @@ export async function GET(request: Request) {
       };
       session.listeners.push(listener);
 
-      // Keep-alive ping every 15s
       const ping = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(": keepalive\n\n"));
@@ -138,8 +127,7 @@ export async function GET(request: Request) {
         }
       }, 15000);
 
-      // Cleanup when client disconnects
-      request.signal.addEventListener("abort", () => {
+      signal.addEventListener("abort", () => {
         clearInterval(ping);
         session.listeners = session.listeners.filter((l) => l !== listener);
       });
@@ -153,4 +141,39 @@ export async function GET(request: Request) {
       Connection: "keep-alive",
     },
   });
+}
+
+// ── Route handlers ──
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+
+    // Non-streaming mode (default)
+    if (body.mode === "http" || (!body.action && body.audio)) {
+      return handleHTTP(body.audio);
+    }
+
+    // Streaming mode
+    if (body.action === "start") return handleStreamStart();
+    if (body.action === "chunk") return handleStreamChunk(body);
+    if (body.action === "stop") return handleStreamStop(body);
+
+    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Internal error";
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
+}
+
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const sessionId = url.searchParams.get("sessionId");
+  if (!sessionId) {
+    return NextResponse.json(
+      { error: "Missing sessionId" },
+      { status: 400 },
+    );
+  }
+  return handleStreamSSE(sessionId, request.signal);
 }
