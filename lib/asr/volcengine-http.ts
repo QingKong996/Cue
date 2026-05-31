@@ -1,7 +1,6 @@
 /**
  * Volcengine non-streaming ASR — one-shot recognition via WebSocket.
  * Opens a WebSocket, sends all audio at once, collects result, closes.
- * Compatible with Vercel serverless (within timeout limits).
  */
 
 import { createVolcengineASR } from "./volcengine";
@@ -11,45 +10,34 @@ export type ASRResult = {
   utterances?: Array<{ text: string; definite: boolean }>;
 };
 
-/**
- * Recognize a complete audio buffer using Volcengine's WebSocket ASR.
- * Audio should be 16kHz mono 16-bit PCM.
- */
 export async function recognizeAudio(
   audioBuffer: ArrayBuffer,
 ): Promise<ASRResult> {
-  console.log(`[ASR WS] Starting recognition, ${audioBuffer.byteLength} bytes`);
+  console.log(`[ASR WS] Starting, ${audioBuffer.byteLength} bytes`);
 
   return new Promise<ASRResult>((resolve, reject) => {
     const parts: string[] = [];
     let settled = false;
 
-    const timeout = setTimeout(() => {
-      console.log(`[ASR WS] Timeout, collected: ${parts.join("")}`);
-      if (!settled) {
-        settled = true;
-        asr.close();
-        resolve({ text: parts.join("") });
-      }
-    }, 12_000);
-
-    function settle() {
+    function settle(text: string) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      const text = parts.join("");
-      console.log(`[ASR WS] Settled with: "${text}"`);
+      console.log(`[ASR WS] Settled: "${text}"`);
       resolve({ text });
     }
 
-    console.log(`[ASR WS] Creating ASR client...`);
+    const timeout = setTimeout(() => {
+      settle(parts.join(""));
+    }, 7_000);
+
     const asr = createVolcengineASR({
-      onPartial(text) {
-        console.log(`[ASR WS] Partial: "${text}"`);
-      },
+      onPartial() {},
       onFinal(text) {
         console.log(`[ASR WS] Final: "${text}"`);
         if (text.trim()) parts.push(text.trim());
+        // Got a result — wait briefly for any remaining, then settle
+        setTimeout(() => settle(parts.join("")), 500);
       },
       onError(error) {
         console.error(`[ASR WS] Error: ${error.message}`);
@@ -61,16 +49,12 @@ export async function recognizeAudio(
       },
     });
 
-    console.log(`[ASR WS] Waiting for ready...`);
     asr.ready
       .then(() => {
-        console.log(`[ASR WS] Ready, sending audio...`);
+        console.log(`[ASR WS] Ready, sending ${audioBuffer.byteLength} bytes`);
         asr.sendChunk(audioBuffer);
-        console.log(`[ASR WS] Audio sent, closing...`);
+        console.log(`[ASR WS] Sending end-of-audio`);
         asr.close();
-        // Close sends end-of-audio signal then closes WS after 1s
-        // Give extra time for server to return final result
-        setTimeout(settle, 3000);
       })
       .catch((err) => {
         console.error(`[ASR WS] Ready failed: ${err}`);

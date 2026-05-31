@@ -19,7 +19,15 @@ async function handleHTTP(audio: string) {
     const bytes = Buffer.from(audio, "base64");
     const ab = new Uint8Array(bytes).buffer;
     console.log(`[ASR HTTP] Received ${bytes.length} bytes`);
-    const result = await recognizeAudio(ab);
+
+    // Timeout wrapper for Vercel serverless
+    const result = await Promise.race([
+      recognizeAudio(ab),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("ASR function timeout")), 8000),
+      ),
+    ]);
+
     console.log(`[ASR HTTP] Result: "${result.text}"`);
     return NextResponse.json(result);
   } catch (err) {
